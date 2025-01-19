@@ -1,16 +1,15 @@
-import OpenAI from 'openai';
-import * as dotenv from 'dotenv';
-import * as path from 'path';
-dotenv.config({ path: path.join(process.cwd(), ".env") });
+import { OpenAI } from 'openai';
 export class HSCodeFSM {
     state;
     currentResults;
     currentNode;
     threadId;
+    clientDb;
     btkiDb;
     openai;
     funcDict;
-    functionMetadata;
+    promptDict;
+    functions;
     constructor(btkiDb) {
         this.state = "general";
         this.currentResults = [];
@@ -20,139 +19,15 @@ export class HSCodeFSM {
         this.openai = new OpenAI({
             apiKey: process.env.OPENAI_API_KEY,
         });
-        // Bind methods
         this.queryByDescription = this.queryByDescription.bind(this);
         this.getNext = this.getNext.bind(this);
         this.confirmHscode = this.confirmHscode.bind(this);
-        this.functionMetadata = [
-            {
-                name: "query_by_description",
-                description: "Search for HS codes using product description",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        user_query: { type: "string", description: "Product description" },
-                        top_k: { type: "integer", description: "Number of results to return", default: 5 }
-                    },
-                    required: ["user_query"]
-                }
-            },
-            {
-                name: "get_next",
-                description: "Get child categories for an HS code",
-                parameters: {
-                    type: "object",
-                    properties: {
-                        id_: { type: "integer", description: "Parent HS code ID" }
-                    },
-                    required: ["id_"]
-                }
-            },
-            {
-                name: "confirm_hscode",
-                description: "Confirm final HS code selection",
-                parameters: {
-                    type: "object",
-                    properties: {},
-                    required: []
-                }
-            }
-        ];
         this.funcDict = {
             query_by_description: this.queryByDescription,
             get_next: this.getNext,
             confirm_hscode: this.confirmHscode
         };
-    }
-    async queryByDescription(userQuery, topK = 5) {
-        const response = await this.btkiDb.queryByDescription(userQuery, topK);
-        this.currentResults = [];
-        this.currentResults.push(...response);
-        return response;
-    }
-    async getNext(id) {
-        console.log(`Getting id ${id}`);
-        return this.btkiDb.findNextPID(id);
-    }
-    async confirmHscode() {
-        const finalCode = this.currentNode ? { ...this.currentNode } : null;
-        this.state = "general";
-        this.currentNode = null;
-        this.currentResults = [];
-        return finalCode;
-    }
-    async processAssistantResponse(response) {
-        console.log("\n\n Processing response: \n" + response);
-        let results = [];
-        if (response.tool_calls?.length) {
-            for (const toolCall of response.tool_calls) {
-                console.log("Calling function");
-                const functionName = toolCall.function.name;
-                const functionArgs = JSON.parse(toolCall.function.arguments);
-                if (this.funcDict[functionName]) {
-                    const result = await this.funcDict[functionName](...Object.values(functionArgs));
-                    if (result) {
-                        if (functionName === 'query_by_description') {
-                            this.currentResults = result;
-                            this.state = "traverse";
-                            results.push(...result);
-                        }
-                        else if (functionName === 'get_next') {
-                            this.currentResults = result;
-                            this.currentNode = Array.isArray(result) ? result[0] : result;
-                            results.push(...result);
-                        }
-                        else if (functionName === 'confirm_hscode') {
-                            results.push(result);
-                        }
-                    }
-                }
-            }
-            return this.parseDbState(results);
-        }
-        console.log("Not Calling functions");
-        return response;
-    }
-    async parseDbState(results) {
-        console.log("Parsing DB -------------------");
-        let tmpRes = "";
-        results.forEach(obj => tmpRes.concat("(" + obj.description + obj.indonesian_description + ")"));
-        if (results && results.length > 0) {
-            const tmpState = this.state;
-            this.state = "parse_db";
-            console.log("Using " + this.getSystemPromptForState() + JSON.stringify(results));
-            this.state = tmpState;
-            return this.runAssistantWithState("", this.getSystemPromptForState() + JSON.stringify(results));
-        }
-        return this.runAssistantWithState("", this.getSystemPromptForState());
-    }
-    async runAssistantWithState(userInput, systemPrompt) {
-        try {
-            const response = await this.openai.chat.completions.create({
-                model: "gpt-4",
-                messages: [
-                    {
-                        role: "system",
-                        content: systemPrompt
-                    },
-                    {
-                        role: "user",
-                        content: userInput
-                    }
-                ],
-                tools: this.functionMetadata.map(fn => ({ type: 'function', function: fn })),
-                tool_choice: "auto",
-                temperature: 0.1
-            });
-            return response.choices[0].message;
-        }
-        catch (error) {
-            console.error('Assistant interaction failed:', error);
-            throw error;
-        }
-    }
-    getSystemPromptForState() {
-        let prompts = {
+        this.promptDict = {
             general: "You are an assistant for Indonesian customs. Help classify HS codes through tree traversal. " +
                 "Translate the user's product description to English if necessary, then call query_by_description. " +
                 "Format function calls as:\nFunction call: query_by_description\nArguments: {\"user_query\": \"translated description\"}",
@@ -162,20 +37,142 @@ export class HSCodeFSM {
                 "If they've provided information that can eliminate some choices, do so. The choices are as follows: ",
             traverse: "You are navigating through HS code categories. " +
                 "Always explain available subcategories to the user before asking for their choice." +
-                "IF the user wants to stop or confirms the current category, call confirm_hscode with no arguments. " +
+                "IF AND ONLY IF the use chose a choice with is_leaf == true, call confirm_hscode with no arguments. " +
                 "ELSE, the user wants to explore subcategories, get the id_ field of the options that best matches the user choice." +
                 "Call Function call: get_next\nArguments: {\"id_\": chosen_id}\n\n" +
-                "NEVER call query_by_description. " +
-                "Choose the matching chosen id from the choices below: " + JSON.stringify(this.currentResults)
+                "NEVER call query_by_description" +
+                "Choose the matching chosen id from the choices below: "
         };
-        return prompts[this.state];
+        this.functions = [
+            {
+                name: "query_by_description",
+                description: "Search for HS codes based on product description",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        user_query: {
+                            type: "string",
+                            description: "Product description to search for"
+                        },
+                        topK: {
+                            type: "string",
+                            description: "Number of results to return"
+                        }
+                    },
+                    required: ["user_query"]
+                }
+            },
+            {
+                name: "get_next",
+                description: "Get subcategories for a given HS code",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        id_: {
+                            type: "string",
+                            description: "ID of the HS code to get subcategories for"
+                        }
+                    },
+                    required: ["id_"]
+                }
+            },
+            {
+                name: "confirm_hscode",
+                description: "Confirm the selected HS code",
+                parameters: {
+                    type: "object",
+                    properties: {},
+                    required: []
+                }
+            }
+        ];
     }
-    async run(userInput) {
-        console.log(`Running FSM in state: ${this.state}`);
-        const systemPrompt = this.getSystemPromptForState();
-        console.log(systemPrompt);
-        const response = await this.runAssistantWithState(userInput, systemPrompt);
-        return (await this.processAssistantResponse(response)).content;
+    async queryByDescription(userQuery, topK = 5) {
+        return await this.btkiDb.queryByDescription(userQuery, topK);
+    }
+    async getNext(id) {
+        console.log(`Getting id ${id}`);
+        return this.btkiDb.findNextPID(id);
+    }
+    async confirmHscode() {
+        return null;
+    }
+    async runAssistantWithState(userInput, systemPrompt) {
+        try {
+            const response = await this.openai.chat.completions.create({
+                model: "gpt-4",
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user", content: userInput }
+                ],
+                functions: this.functions,
+                function_call: "auto",
+                temperature: 0.1
+            });
+            return response.choices[0].message;
+        }
+        catch (error) {
+            console.error('Assistant interaction failed:', error);
+            throw error;
+        }
+    }
+    async processAssistantResponse(response, stateObject) {
+        console.log("\n\n Processing response: \n");
+        console.log("System gave response" + JSON.stringify(response.function_call));
+        let results = [];
+        let newStateObject = { ...stateObject };
+        if (response.function_call) {
+            console.log("Calling function");
+            // for (const toolCall of response) {
+            const toolCall = response.function_call;
+            const functionName = toolCall.name;
+            const functionArgs = JSON.parse(toolCall.arguments);
+            if (this.funcDict[functionName]) {
+                const result = await this.funcDict[functionName](...Object.values(functionArgs));
+                if (result) {
+                    if (functionName === 'query_by_description') {
+                        results.push(...result);
+                        newStateObject = {
+                            state: 'traverse',
+                            currentResults: result,
+                            currentNode: null
+                        };
+                    }
+                    else if (functionName === 'get_next') {
+                        results.push(...result);
+                        newStateObject = {
+                            state: stateObject.state,
+                            currentResults: result,
+                            currentNode: Array.isArray(result) ? result[0] : result
+                        };
+                    }
+                    else if (functionName === 'confirm_hscode') {
+                        results.push(result);
+                        newStateObject = {
+                            state: 'general',
+                            currentResults: [],
+                            currentNode: null
+                        };
+                    }
+                }
+            }
+            // }
+            return { message: results, stateObject: newStateObject };
+        }
+        return {
+            message: response.content || '',
+            stateObject: newStateObject
+        };
+    }
+    async run(chatRequest) {
+        const { messages, stateObject } = chatRequest;
+        let systemPrompt = this.promptDict[stateObject.state];
+        console.log(messages[messages.length - 1].content);
+        if (stateObject.state === 'traverse') {
+            systemPrompt = systemPrompt + JSON.stringify(stateObject.currentResults);
+        }
+        const assistantResponse = await this.runAssistantWithState(messages[messages.length - 1].content, systemPrompt);
+        return await this.processAssistantResponse(assistantResponse, stateObject);
     }
 }
 export default HSCodeFSM;

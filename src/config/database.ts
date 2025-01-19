@@ -132,7 +132,7 @@ export const hsDb: HsDb = {
                 IndexName: "ParentIdIndex",
                 KeyConditionExpression: "parent_id = :pid",
                 ExpressionAttributeValues: {
-                    ":pid": pid 
+                    ":pid": Number(pid)
                 }
             };
             const command = new QueryCommand(params);
